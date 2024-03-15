@@ -1,0 +1,488 @@
+---
+jupyter:
+  jupytext:
+    formats: ipynb,Rmd,py:percent
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.2'
+      jupytext_version: 1.13.6
+  kernelspec:
+    display_name: Python 3 (ipykernel)
+    language: python
+    name: python3
+---
+
+# Kuzushijis Recognition
+### Opening the door to a thousand years of Japanese culture.
+
+
+![Header!](./header.png)
+
+
+# TODO: INTODUCTION AND DATA SOURCE
+
+```{python}
+# %matplotlib inline
+```
+
+```{python}
+import matplotlib.pyplot as plt
+import matplotlib
+import numpy as np
+import pandas as pd
+import re
+from sklearn.model_selection import train_test_split
+# matplotlib.use("")
+
+import tensorflow as tf
+
+from object_detection.utils import dataset_util, config_util
+from object_detection.utils import visualization_utils as viz_utils
+from object_detection.builders import model_builder
+from imageio import imread
+from matplotlib.patches import Rectangle
+```
+
+```{python}
+tf.__version__
+```
+
+# 1. Data Prep
+
+
+First we would like to read our dataset containing the segmented labels of the Japanese text. It is stored in a CSV file.
+Each row contains the segmented labels of a single image. The first column contains the image ID, the second column contains the segmented labels. The labels are separated by a space. They are in the form of a separated series of values, where `Unicode character` (class), `x-coordinate` (left), `y-coordinate` (top), `width` (width), `height` (height) are repeated for every object found in the perticular photo.
+
+```{python}
+raw_labels = pd.read_csv('data/train.csv')
+```
+
+```{python}
+raw_labels
+```
+
+So we'd like to split the string in the second column before each new segment. The code below does just that. It splits the whole string by each 'U' character. All the labels start with 'U', because they encode an Unicode character.
+
+```{python}
+# Split every string before every new unicode character label.
+raw_labels.labels = raw_labels.labels.str.split(pat=r" (?=U)")
+```
+
+Now we want a separate row for each label. We achieve that by using the `explode` function.
+
+```{python}
+exploded_labels = raw_labels.explode('labels')
+exploded_labels
+```
+
+Let's also split the labels column into 5 different columns (one for the class, two for the location of the box and two for the size of the box).
+
+```{python}
+exploded_labels[["class", "x", "y", "w", "h"]] = exploded_labels.labels.str.split(' ', expand=True)
+labels_df = exploded_labels.drop(columns=['labels'])
+labels_df
+```
+
+Now let's fix up the datatypes for each column.
+
+```{python}
+labels_df.dtypes
+```
+
+We want the `class` column to be of type category, because it contains a list of all the classes. The `x-coordinate`, `y-coordinate`, `width` and `height` columns are of type `float32`, because they contain the box dimensions.
+
+```{python}
+labels_df["class"] = labels_df["class"].astype("category")
+
+for col_name in ["x", "y", "w", "h"]:
+    labels_df[col_name] = labels_df[col_name].astype("float32")
+```
+
+```{python}
+labels_df.dtypes
+```
+
+Now we need to create a label map, mapping each class to an integer. The TensorFlow Detection API requires it to be a `StringIntLabelMap` text protobuf. Pandas' `Category` type has a `codes` attribute, which contains each class, encoded as a number.
+
+```{python}
+unique_labels = labels_df["class"].cat.categories.unique()
+unique_labels = unique_labels.tolist()
+# Below we add 1 to every label to make it start from 1 instead of 0. This is how they are required by the OD library.
+unique_codes = labels_df["class"].cat.codes.unique() + 1
+unique_codes = unique_codes.tolist()
+
+# Now we zip the codes and labels together.
+label_map_dict = dict(zip(unique_labels, unique_codes))
+label_map_dict
+```
+
+We have the label mapping array. Now we can safely replace the class column in the dataframe with a new one, containing the class, encoded as a number.
+
+```{python}
+labels_df["class_name"] = labels_df["class"]
+labels_df["class"] = pd.Categorical(labels_df["class"].map(label_map_dict))
+```
+
+```{python}
+for i in label_map_dict:
+    print(i)
+```
+
+```{python}
+labels_df
+```
+
+```{python}
+label_map_file = open("./data/label_map.pbtxt", "w")
+for class_name in label_map_dict:
+    class_code = label_map_dict[class_name]
+    label_map_file.write((
+        'item {\n'
+        f'   display_name: "{class_name}"\n'
+        f'   id: {class_code}\n'
+        f'   name: "{class_name}"\n'
+        '}\n'
+    ))
+    
+label_map_file.close()
+```
+
+Now that we have the labels ready and the label map, created in the proper format, we can take a look at how the data is distributed and what exactly do the raw images look like.
+
+
+First let's plot the number of samples, which we have for each class.
+
+```{python}
+character_class_count = labels_df.class_name.value_counts()
+
+plt.figure(figsize=(20, 5))
+
+character_class_count.plot()
+
+plt.xlabel("Character Class")
+plt.ylabel("Number of occurrences in the training set")
+
+plt.show()
+```
+
+```{python}
+character_class_count.describe()
+```
+
+From the plot we can see that some of the classes appear a lot more than the other ones. Our dataset is highly imbalanced. Also while 75% percent of the classes appear only around 9 times in the dataset, for one particular character we have around 25k samples. We have 162 records on average per class. This seems fine, but it is actually influenced by the very high frequency for only a few a characters. Let see which ones are those.
+
+
+First let's read in the unicode translation table, so that we can actually see which classes respond to which characters.
+
+```{python}
+unicode_translation = pd.read_csv("data/unicode_translation.csv", index_col=0, squeeze=True)
+```
+
+```{python}
+top_10_freq_classes = character_class_count.head(10)
+last_10_freq_classes = character_class_count.tail(10)
+unicode_translation[top_10_freq_classes.index], unicode_translation[last_10_freq_classes.index]
+```
+
+So the most frequently appearing characters correspond to single sounds/letters. The last ones are more complex and specific words, which isn't that surprising. But we want our model do classify well all different types of classes and generalize even in these extreme scenarios. 
+
+
+===================================================================================================================
+
+
+Lastly, let's look at the dimensions of the images, which we have. It might be better for us to crop them into regions, before we give them to the model, because they are probably too large.
+
+```{python}
+def read_image_tf(image_id):
+    """
+    Reads an image from the training directory into tensorflow and returns it.
+    """
+    return tf.io.read_file(f'./data/train_images/{image_id}.jpg')
+```
+
+```{python}
+def get_image_shape(image_id):
+    """
+    Read an image end extract its dimensions.
+    """
+    return imread(f'./data/train_images/{image_id}.jpg').shape
+```
+
+```{python}
+unique_image_ids = pd.Series(labels_df.image_id.unique())
+all_images_dims = unique_image_ids.apply(get_image_shape)
+```
+
+```{python}
+all_images_dims = pd.DataFrame(all_images_dims.to_list(), columns=["height", "width", "channels"])
+```
+
+```{python}
+all_images_dims.describe()
+```
+
+As we can see from the table above, the mean height for an image is around 3000 pixels and the mean width - around 2000. This is a lot. 
+
+```{python}
+timage = read_image_tf(unique_image_ids.iloc[0])
+```
+
+```{python}
+def split_image(image3, tile_size):
+    image_shape = tf.shape(image3)
+    print(image_shape)
+    tile_rows = tf.reshape(image3, [image_shape[0], -1, tile_size[1], image_shape[2]])
+    serial_tiles = tf.transpose(tile_rows, [1, 0, 2, 3])
+    return tf.reshape(serial_tiles, [-1, tile_size[1], tile_size[0], image_shape[2]])
+```
+
+```{python}
+def pad_image_to_tile_multiple(image3, tile_size, padding="CONSTANT"):
+    imagesize = tf.shape(image3)[0:2]
+    padding_ = tf.cast(tf.math.ceil(imagesize / tile_size), "int32") * tile_size - imagesize
+    return tf.pad(image3, [[0, padding_[0]], [0, padding_[1]], [0, 0]], padding)
+
+```
+
+```{python}
+# tf.image.crop_and_resize(timage, )
+# image = tf.expand_dims(tf.io.decode_image(timage), axis=0)
+BATCH_SIZE = 1
+NUM_BOXES = 5
+CHANNELS = 3
+CROP_SIZE = (512, 512)
+
+im = tf.io.decode_image(timage).numpy()
+# plt.imshow(image)
+boxes = tf.random.uniform(shape=(NUM_BOXES, 4))
+box_indices = tf.random.uniform(shape=(NUM_BOXES,), minval=0, maxval=BATCH_SIZE, dtype=tf.int32)
+# output = split_image(image[0], CROP_SIZE)
+# output.shape
+```
+
+```{python}
+M = im.shape[0]//2
+N = im.shape[1]//2
+
+tiles = [im[x:x+M,y:y+N] for x in range(0,im.shape[0],M) for y in range(0,im.shape[1],N)]
+for i in tiles:
+    plt.imshow(i)
+    plt.show()
+```
+
+```{python}
+for i in range(len(output)):
+    plt.subplot(output.shape[0] // 3 + 1, 3, i + 1)
+    plt.imshow(output[i].numpy().astype('uint8'))
+output.shape[0] // 3 + 1
+```
+
+===================================================================================================================
+
+
+But before we look at possible solutions like data augmentation, let's create a validation set and set up the training data in a `tfrecord` format.
+
+
+Let's try to display the data for one of the images in the dataset, to see what it looks like.
+
+```{python}
+def read_image(image_id):
+    """
+    Reads an image from the training directory into a numpy array and returns it.
+    """
+    return imread(f'./data/train_images/{image_id}.jpg')
+```
+
+```{python}
+image_id_test = labels_df.iloc[0].image_id
+labels_test = labels_df[labels_df.image_id == image_id_test]
+labels_coords_test = labels_test[["x", "y", "w", "h"]]
+
+image_data = read_image(image_id_test)
+
+fig, ax = plt.subplots(figsize=(9, 9))
+
+ax.imshow(image_data)
+
+for box_coords in labels_coords_test.itertuples():
+    bounding_box_fig = Rectangle((box_coords.x, box_coords.y), box_coords.w, box_coords.h, fill=False, edgecolor='red', linewidth=2)
+    ax.add_patch(bounding_box_fig)
+
+plt.show()
+```
+
+The function below now will create a `tf.train.Example` from a given image data and labels.
+
+```{python}
+def create_tf_example(image_name):
+    """
+    Creates a tf.Example proto from a given image name.
+    
+    Parameters
+    ----------
+    image_name: The name of the jpg image.
+
+    Returns
+    ----------
+    example: The created tf.Example.
+    """
+    
+    filename = b'{image_name}.jpg'
+    image_path = f'data/train_images/{image_name}.jpg'
+    image_format = b'jpg'
+    
+    # Read the image file as bytes.
+    with tf.io.gfile.GFile(image_path, 'rb') as f:
+        encoded_image_data = f.read()
+        
+    # Extract the image's dimensions.
+    image_shape_tensor = tf.io.extract_jpeg_shape(encoded_image_data)
+    
+    height = image_shape_tensor[0].numpy()
+    width = image_shape_tensor[1].numpy()
+    
+    # Get the rows from the dataframe, corresponding to the given image.
+    current_labels = labels_df[labels_df.image_id == image_name]
+    
+    xmins_np = current_labels["x"].to_numpy()
+    xmaxs_np = current_labels["w"].to_numpy() + xmins_np
+    ymins_np = current_labels["y"].to_numpy()
+    ymaxs_np = current_labels["h"].to_numpy() + ymins_np
+
+    # Scaling the coordinates to the range [0, 1] and converting them back to regular python lists.
+    xmins = xmins_np / width
+    xmaxs = xmaxs_np / width
+    ymins = ymins_np / height
+    ymaxs = ymaxs_np / height
+    
+    # Convert the string labels to a list of bytes.
+    classes_text = current_labels["class_name"] \
+                    .apply(lambda cls: bytes(cls, encoding="utf-8")) \
+                    .to_list()
+    
+    classes = current_labels["class"].to_list()
+
+    # Create the actual tf.Example object.
+    tf_example = tf.train.Example(features=tf.train.Features(feature={
+        'image/height': dataset_util.int64_feature(height),
+        'image/width': dataset_util.int64_feature(width),
+        'image/filename': dataset_util.bytes_feature(filename),
+        'image/source_id': dataset_util.bytes_feature(filename),
+        'image/encoded': dataset_util.bytes_feature(encoded_image_data),
+        'image/format': dataset_util.bytes_feature(image_format),
+        'image/object/bbox/xmin': dataset_util.float_list_feature(xmins),
+        'image/object/bbox/xmax': dataset_util.float_list_feature(xmaxs),
+        'image/object/bbox/ymin': dataset_util.float_list_feature(ymins),
+        'image/object/bbox/ymax': dataset_util.float_list_feature(ymaxs),
+        'image/object/class/text': dataset_util.bytes_list_feature(classes_text),
+        'image/object/class/label': dataset_util.int64_list_feature(classes),
+    }))
+    
+    return tf_example
+```
+
+Before we continue on creating the desired `tfrecord` files, let's create a stratified validation split.
+
+```{python}
+unique_image_ids
+```
+
+Something, which might help us with the validation of the models is to test them on all the different styles of pages. The images, which we are provided with in the training set come from a few different books. For example: `100241706_00005_1` and `100241706_00016_2`, which we can see below, are too pages from the same book, while `umgy012-041` and `umgy012-023` are from another one. The first "part" of the filename for each image signifies which book does the page come from. We can create a new dataframe, holding the names of all images in our dataset and their corresponding book titles. Then we can split them randomly into a training set (85% percent of the data, because we don't have that many samples) and a validation set. For testing we will use the data provided by the competition. 
+
+```{python}
+fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(10, 10))
+fig.suptitle('Different types of pages')
+
+ax1.set_title("Book: 100241706")
+ax2.set_title("Book: 100241706")
+ax1.imshow(read_image('100241706_00005_1'))
+ax2.imshow(read_image('100241706_00005_2'))
+
+ax3.set_title("Book: umgy012")
+ax4.set_title("Book: umgy012")
+ax3.imshow(read_image('umgy012-041'))
+ax4.imshow(read_image('umgy012-023'))
+```
+
+```{python}
+def extract_book(filename):
+    """
+    Function to extract the book_id from a filename of an image in the dataset.
+    """
+    # Three of the book_ids contain only letters and need to be split by the first occurance of a digit.
+    if filename[0] >= 'a' and filename[0] <= 'z':
+        return re.split(r'(^[^\d]+)', filename)[1]
+    # The rest can be simply split by the first '-' or '_' symbol
+    else:
+        return re.split(r"[-_]", filename)[0]
+```
+
+```{python}
+pages_df = pd.DataFrame([unique_image_ids, unique_image_ids]).T
+pages_df.columns = ["image_id", "book_id"]
+pages_df.book_id = pages_df.book_id.apply(extract_book)
+pages_df
+```
+
+We can now create a stratified validation split based on the `book_id`.
+
+```{python}
+training_ids, validation_ids = train_test_split(pages_df.image_id, train_size = 0.90, stratify = pages_df.book_id, random_state=23)
+len(training_ids), len(validation_ids)
+```
+
+Finally we are ready to build the two different `tfrecord` files for testing and validation. 
+
+```{python}
+def create_tfrecord(filename, image_ids):
+    """
+    Creates a tfrecord file with all the data for the given image_ids and saves it with the given filename.
+    """
+    writer = tf.io.TFRecordWriter(filename)
+    for image_id in image_ids:
+        tf_example = create_tf_example(image_id)
+        writer.write(tf_example.SerializeToString())
+    writer.close()
+    pass
+```
+
+```{python}
+create_tfrecord("./data/train.record", training_ids)
+create_tfrecord("./data/validation.record", validation_ids)
+```
+
+Now let's read in those files and create `tf.data.Dataset`s from them.
+
+```{python}
+training_dataset = tf.data.TFRecordDataset("./data/train.record")
+validation_dataset = tf.data.TFRecordDataset("./data/validation.record")
+```
+
+There are generally two approaches, regarding the model architecture:
+    Single model, which combines the localization and classification tasks into a single more complex model. Faster-RCNN and CenterNet are such models. 
+    2-stage architecture, where one model does the localization of the objects in the image and another one classifies them.
+    
+For a one-stage model, I've chosen to start with a CenterNet architecture and a ResNet backbone. CenterNet tries to solve some of Faster-RCNN's problems. It abandons the anchor methodology and instead tries to learn to create a keypoint heatmap, which is later predicted by one part of the model. Another one regresses each box' dimensions and offsets just like in other models. Only here instead of doing regular NMS (non-max suppression) to remove unnecessary predictions, which compares every two boxes' IoU, the algorithm uses the predicted heatmap to discard all the boxes, where the center doesn't coincide with the actual region on the heatmap. This is a lot faster and computationally cheaper. That is why first I'll try this architecture.
+I've chosen a residual network for the backbone, because it is also easier to compute, compared to for example HourGlass. If the performance is significantly worse, we will change it up later.
+
+
+Now we will prepare our model for training using the proper config file and loading in the pretrained weights for the backbone network.
+
+```{python}
+tf.keras.backend.clear_session()
+
+NUM_CLASSES = len(labels_df[labels_df.image_id.isin(training_ids.values)]["class"].unique())
+PIPELINE_CONFIG = './models/centernet_resnet101_v1_fpn_512x512/pipeline.config'
+CKPT_PATH = './models/centernet_resnet101_v1_fpn_512x512/checkpoint/ckpt-0'
+
+configs = config_util.get_configs_from_pipeline_file(PIPELINE_CONFIG)
+model_config = configs['model']
+model_config.center_net.num_classes = NUM_CLASSES
+
+detection_model = model_builder.build(model_config=model_config, is_training=True)
+```
+
+```{python}
+NUM_CLASSES
+```
